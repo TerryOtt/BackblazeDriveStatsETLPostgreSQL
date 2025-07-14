@@ -2,11 +2,14 @@ package main
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"sync"
 )
 
 func readCsvFiles(
 	csvChannel chan string,
+	driveModelToDriveModelId map[string]uuid.UUID,
+	driveSerialNumberToDriveIde map[string]uuid.UUID,
 	datapointChannel chan string,
 	wg *sync.WaitGroup) {
 
@@ -16,7 +19,11 @@ func readCsvFiles(
 	for csvFile := range csvChannel {
 		fmt.Printf("Reader working reading CSV file \"%s\"\n", csvFile)
 		// Pretend we got some CSV
-		datapointChannel <- "totally legit datapoint"
+		modelId, ok := driveModelToDriveModelId[csvFile]
+		if ok {
+			datapointChannel <- modelId.String()
+		}
+
 	}
 
 	// Have to mark all our work is done before we bail
@@ -54,9 +61,13 @@ func main() {
 
 	fmt.Println("Starting reader workers")
 	const numReaders int = 1
+	// lock and map for ID assignments
+	driveModelToDriveModelId := make(map[string]uuid.UUID)
+	driveSerialNumberToDriveId := make(map[string]uuid.UUID)
 	for i := 0; i < numReaders; i++ {
 		readerWg.Add(1)
-		go readCsvFiles(csvFilenamesChannel, datapointsChannel, &readerWg)
+		go readCsvFiles(csvFilenamesChannel, driveModelToDriveModelId, driveSerialNumberToDriveId,
+			datapointsChannel, &readerWg)
 	}
 	fmt.Println("Starting writer workers")
 	const numWriters = 1
