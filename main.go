@@ -1,83 +1,89 @@
 package main
 
 import (
+	"flag"
 	"fmt"
-	"github.com/google/uuid"
+	"os"
+	"runtime"
+	"strconv"
 	"sync"
 )
 
-func readCsvFiles(
-	csvChannel chan string,
-	driveModelToDriveModelId map[string]uuid.UUID,
-	driveSerialNumberToDriveIde map[string]uuid.UUID,
-	datapointChannel chan string,
+func readCsvFiles(csvChannel chan string,
+	datapointsChannel chan string,
 	wg *sync.WaitGroup) {
 
 	fmt.Println("Waiting for CSV filenames over channel")
 
 	// Read from channel until it is closed
 	for csvFile := range csvChannel {
-		fmt.Printf("Reader working reading CSV file \"%s\"\n", csvFile)
-		// Pretend we got some CSV
-		modelId, ok := driveModelToDriveModelId[csvFile]
-		if ok {
-			datapointChannel <- modelId.String()
-		}
-
+		fmt.Printf("Reading CSV file %s\n", csvFile)
 	}
 
 	// Have to mark all our work is done before we bail
 	wg.Done()
 }
 
-func queueDatapointForWrite(
-	datapointChannel chan string,
-	wg *sync.WaitGroup) {
+func parseArgs() map[string]any {
 
-	fmt.Println("Waiting for datapoints to be queued")
+	numCpus := runtime.NumCPU()
 
-	// Read from channel until it's closed
-	for datapoint := range datapointChannel {
-		fmt.Printf("Writer worker got datapoint: \"%s\"\n", datapoint)
+	// Have one positional arg (CSV dir) and two optional flags,
+	//		-r/--readers and -w/--writers
+
+	numReaders := flag.Int("readers", numCpus, "Number of reader workers, defaults to CPU count")
+	numWriters := flag.Int("writers", numCpus, "Number of writer workers, defaults to CPU count")
+
+	// Now parse the args
+	flag.Parse()
+
+	// Make sure we got exactly one positional arg
+	if flag.NArg() != 1 {
+		fmt.Println("Usage: prog [--readers READERS] [--writers WRITERS] <CSV dir>")
+		os.Exit(1)
 	}
 
-	// All our work is done, note that before we bail
-	wg.Done()
+	args := map[string]any{
+		"readers": *numReaders,
+		"writers": *numWriters,
+		"csvDir":  flag.Arg(0),
+	}
+
+	return args
+}
+
+func getCsvListFromDir(csvDir string) []string {
+	fmt.Println("CSV dir is " + csvDir)
+	csvList := []string{}
+	return csvList
 }
 
 func main() {
 	fmt.Println("Parsing cmdline args")
+	args := parseArgs()
+
+	fmt.Println("Finding CSV files")
+	csvList := getCsvListFromDir(args["csvDir"].(string))
+	fmt.Println("Number of CSV files: " + strconv.Itoa(len(csvList)))
+
 	// Create channel to send CSV to readers
-	var readerWg sync.WaitGroup
-	const csvChannelSize int = 16384
-	csvFilenamesChannel := make(chan string, csvChannelSize)
+	var csvWg sync.WaitGroup
+	csvFilenamesChannel := make(chan string)
 
 	// Create channel to send datapoints to writers
 	const (
-		// CHANNEL_SIZE 512 MB of datapoints at 400 bytes/datapoint (roughly)
-		datapointChannelSize int = (512 * 1024 * 1024) / 400
+		// ChannelSize 512 MB of datapoints at 400 bytes/datapoint (roughly)
+		ChannelSize int = (512 * 1024 * 1024) / 400
 	)
-	datapointsChannel := make(chan string, datapointChannelSize)
+	datapointsChannel := make(chan string, ChannelSize)
 
 	fmt.Println("Starting reader workers")
-	const numReaders int = 1
-	// lock and map for ID assignments
-	driveModelToDriveModelId := make(map[string]uuid.UUID)
-	driveSerialNumberToDriveId := make(map[string]uuid.UUID)
-	for i := 0; i < numReaders; i++ {
-		readerWg.Add(1)
-		go readCsvFiles(csvFilenamesChannel, driveModelToDriveModelId, driveSerialNumberToDriveId,
-			datapointsChannel, &readerWg)
+	const NumReaders int = 1
+	for i := 0; i < NumReaders; i++ {
+		csvWg.Add(1)
+		go readCsvFiles(csvFilenamesChannel, datapointsChannel, &csvWg)
 	}
 	fmt.Println("Starting writer workers")
-	const numWriters = 1
-	var writerWg sync.WaitGroup
-	for i := 0; i < numWriters; i++ {
-		writerWg.Add(1)
-		go queueDatapointForWrite(datapointsChannel, &writerWg)
-	}
-
-	fmt.Println("Finding CSV files")
 	// Send all CSV files over the channel to the readers
 	csvFilenamesChannel <- "somefile.csv"
 
@@ -85,13 +91,9 @@ func main() {
 	close(csvFilenamesChannel)
 	fmt.Println("CSV reads have kicked off")
 	// Wait on reader waitgroup
-	readerWg.Wait()
+	csvWg.Wait()
 	fmt.Println("All datapoints have been read, waiting for writes to complete")
-
-	// All readers have finished, so datapoint can be closed to signal that
-	close(datapointsChannel)
-
-	// Wait until all writers are done
-	writerWg.Wait()
+	// Poison pill the writers
+	// Wait for writers waitgroup to finish
 	fmt.Println("All datapoints have been successfully written")
 }
