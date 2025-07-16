@@ -2,6 +2,7 @@
   <dictionary name="project">
     <words>
       <w>datapoints</w>
+      <w>waitgroup</w>
     </words>
   </dictionary>
 </component>
