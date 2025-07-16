@@ -76,7 +76,7 @@ func readCsvFiles(csvChannel chan string,
 				CapacityBytes:     capacityBytes,
 				Failure:           uint8(failure),
 			}
-
+			// TODO: assign unique drive model and drive ID's
 			datapointsChannel <- newDatapoint
 
 		}
