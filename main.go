@@ -3,7 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -53,8 +55,20 @@ func parseArgs() map[string]any {
 }
 
 func getCsvListFromDir(csvDir string) []string {
-	fmt.Println("CSV dir is " + csvDir)
-	csvList := []string{}
+	fmt.Println("\tCSV dir is " + csvDir)
+	rootDir := os.DirFS(csvDir)
+	var csvList []string
+	csvFound := 0
+	fs.WalkDir(rootDir, ".",
+		func(path string, d fs.DirEntry, err error) error {
+			if filepath.Ext(path) == ".csv" {
+				csvList = append(csvList, path)
+				csvFound++
+			}
+			return nil
+		})
+
+	fmt.Println("\tNumber of CSV files: " + strconv.Itoa(csvFound))
 	return csvList
 }
 
@@ -64,11 +78,12 @@ func main() {
 
 	fmt.Println("Finding CSV files")
 	csvList := getCsvListFromDir(args["csvDir"].(string))
-	fmt.Println("Number of CSV files: " + strconv.Itoa(len(csvList)))
 
 	// Create channel to send CSV to readers
 	var csvWg sync.WaitGroup
-	csvFilenamesChannel := make(chan string)
+
+	// Make sure writer of filenames to this channel never buffers
+	csvFilenamesChannel := make(chan string, len(csvList))
 
 	// Create channel to send datapoints to writers
 	const (
@@ -85,7 +100,9 @@ func main() {
 	}
 	fmt.Println("Starting writer workers")
 	// Send all CSV files over the channel to the readers
-	csvFilenamesChannel <- "somefile.csv"
+	for _, currCsvFilename := range csvList {
+		csvFilenamesChannel <- currCsvFilename
+	}
 
 	// Close the channel to bring readers home
 	close(csvFilenamesChannel)
