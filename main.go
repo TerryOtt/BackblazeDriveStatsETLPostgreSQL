@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"io/fs"
 	"os"
@@ -17,12 +18,39 @@ import (
 type DriveHealthDatapoint struct {
 	Date              time.Time
 	DriveSerialNumber string
+	DriveId           uuid.UUID
 	DriveModel        string
+	DriveModelId      uuid.UUID
 	CapacityBytes     uint64
 	Failure           uint8
 }
 
-func readCsvFiles(csvChannel chan string,
+type IdAssignmentCaches struct {
+	DriveModelIdsLock          sync.RWMutex
+	DriveIdsLock               sync.RWMutex
+	DriveModelsToDriveModelIds map[string]uuid.UUID
+	DriveSerialNumberToId      map[string]uuid.UUID
+}
+
+func addIdValuesToDatapoint(
+	caches *IdAssignmentCaches,
+	datapoint *DriveHealthDatapoint) {
+
+	// If we know the drive ID, we know the drive model as well
+	caches.DriveIdsLock.RLock()
+	defer caches.DriveIdsLock.RUnlock()
+	driveId, ok := caches.DriveSerialNumberToId[datapoint.DriveSerialNumber]
+	if ok {
+		// We knew the drive ID, so we know everything
+		datapoint.DriveId = driveId
+		caches.DriveModelIdsLock.RLock()
+		datapoint.DriveModelId = caches.
+	}
+}
+
+func readCsvFiles(
+	idCaches *IdAssignmentCaches,
+	csvChannel chan string,
 	datapointsChannel chan DriveHealthDatapoint,
 	wg *sync.WaitGroup) {
 
@@ -72,10 +100,13 @@ func readCsvFiles(csvChannel chan string,
 			newDatapoint := DriveHealthDatapoint{
 				Date:              datapointDate,
 				DriveSerialNumber: csvRow[1],
+				DriveId:           uuid.Nil,
 				DriveModel:        csvRow[2],
+				DriveModelId:      uuid.Nil,
 				CapacityBytes:     capacityBytes,
 				Failure:           uint8(failure),
 			}
+			addIdValuesToDatapoint(idCaches, &newDatapoint)
 			// TODO: assign unique drive model and drive ID's
 			datapointsChannel <- newDatapoint
 
@@ -143,7 +174,7 @@ func writerWorker(datapointChannel chan DriveHealthDatapoint, wg *sync.WaitGroup
 		datapointsReadFromChannel++
 	}
 
-	fmt.Println("\t\tWriter saw this many datapoints: ", datapointsReadFromChannel)
+	fmt.Println("\tWriter saw this many datapoints: ", datapointsReadFromChannel)
 	// Mark that we've done our work to let the waitgroup proceed towards
 	//		unblocking
 	wg.Done()
@@ -170,10 +201,17 @@ func main() {
 	datapointsChannel := make(chan DriveHealthDatapoint, ChannelSize)
 
 	//fmt.Println("Starting reader workers")
+	idCaches := &IdAssignmentCaches{
+		DriveModelIdsLock:          sync.RWMutex{},
+		DriveIdsLock:               sync.RWMutex{},
+		DriveModelsToDriveModelIds: make(map[string]uuid.UUID),
+		DriveSerialNumberToId:      make(map[string]uuid.UUID),
+	}
+
 	const NumReaders int = 20
 	for i := 0; i < NumReaders; i++ {
 		csvWg.Add(1)
-		go readCsvFiles(csvFilenamesChannel, datapointsChannel, &csvWg)
+		go readCsvFiles(idCaches, csvFilenamesChannel, datapointsChannel, &csvWg)
 	}
 
 	//fmt.Println("Starting writer workers")
@@ -194,6 +232,10 @@ func main() {
 	//fmt.Println("CSV reads have kicked off")
 	// Wait on reader waitgroup
 	csvWg.Wait()
+
+	// at this point, we can mark the ID caches eligible for garbage collection
+	idCaches = nil
+
 	fmt.Println("All datapoints have been read, waiting for writes to complete")
 
 	// Signal writers that they should terminate once their channel is empty,
