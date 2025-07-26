@@ -26,8 +26,7 @@ type DriveHealthDatapoint struct {
 }
 
 type IdAssignmentCaches struct {
-	DriveModelIdsLock          sync.RWMutex
-	DriveIdsLock               sync.RWMutex
+	CachesLock                 sync.RWMutex
 	DriveModelsToDriveModelIds map[string]uuid.UUID
 	DriveSerialNumberToId      map[string]uuid.UUID
 }
@@ -36,16 +35,56 @@ func addIdValuesToDatapoint(
 	caches *IdAssignmentCaches,
 	datapoint *DriveHealthDatapoint) {
 
-	// If we know the drive ID, we know the drive model as well
-	caches.DriveIdsLock.RLock()
-	defer caches.DriveIdsLock.RUnlock()
-	driveId, ok := caches.DriveSerialNumberToId[datapoint.DriveSerialNumber]
-	if ok {
-		// We knew the drive ID, so we know everything
+	caches.CachesLock.RLock()
+	// *** CRITICAL SECTION -- READ ONLY -- BEGIN
+	driveId, driveIdOk := caches.DriveSerialNumberToId[datapoint.DriveSerialNumber]
+	driveModelId, driveModelIdOk := caches.DriveModelsToDriveModelIds[datapoint.DriveModel]
+	// *** CRITICAL SECTION -- READ ONLY -- END
+	caches.CachesLock.RUnlock()
+
+	if driveIdOk {
+		// We knew the drive ID, we better know everything
+		if !driveModelIdOk {
+			panic("Knew drive ID but not model ID, should not happen")
+		}
+		//fmt.Println("\tCache hit!")
 		datapoint.DriveId = driveId
-		caches.DriveModelIdsLock.RLock()
-		datapoint.DriveModelId = caches.
+		datapoint.DriveModelId = driveModelId
+		return
 	}
+
+	// Acquire exclusive write lock and make any insertions to BOTH cache and Postgres that are needed
+	caches.CachesLock.Lock()
+
+	// *** CRITICAL SECTION -- BEGIN
+
+	// Need to refresh reads as we gave up the read lock, another goroutine could have updated
+	//	one or both values before we acquired the write lock
+	driveId, driveIdOk = caches.DriveSerialNumberToId[datapoint.DriveSerialNumber]
+	driveModelId, driveModelIdOk = caches.DriveModelsToDriveModelIds[datapoint.DriveModel]
+
+	// Handle drive model cache miss
+	if !driveModelIdOk {
+		//fmt.Println("\tCache miss on drive model ID")
+		driveModelId = uuid.New()
+		caches.DriveModelsToDriveModelIds[datapoint.DriveModel] = driveModelId
+		// TODO: add to postgres
+	}
+
+	// Handle drive serial number cache miss
+	if !driveIdOk {
+		//fmt.Println("\tCache miss on drive ID")
+		driveId = uuid.New()
+		caches.DriveSerialNumberToId[datapoint.DriveSerialNumber] = driveId
+		// TODO: add to postgres
+	}
+
+	// *** CRITICAL SECTION -- END
+	caches.CachesLock.Unlock()
+
+	// Populate datapoint
+	datapoint.DriveId = driveId
+	datapoint.DriveModelId = driveModelId
 }
 
 func readCsvFiles(
@@ -106,10 +145,12 @@ func readCsvFiles(
 				CapacityBytes:     capacityBytes,
 				Failure:           uint8(failure),
 			}
-			addIdValuesToDatapoint(idCaches, &newDatapoint)
-			// TODO: assign unique drive model and drive ID's
-			datapointsChannel <- newDatapoint
 
+			// This call adds any new ID's generated to postgres before returning
+			addIdValuesToDatapoint(idCaches, &newDatapoint)
+
+			// Now datapoint is safe to pass to datapoint writers for eventual write
+			datapointsChannel <- newDatapoint
 		}
 	}
 
@@ -169,8 +210,14 @@ func writerWorker(datapointChannel chan DriveHealthDatapoint, wg *sync.WaitGroup
 
 	// Read from channel until it's both empty AND closed
 	datapointsReadFromChannel := 0
-	for _ = range datapointChannel {
+	for currDatapoint := range datapointChannel {
 		//fmt.Println("\t\tWriter worker got datapoint: ", currDatapoint)
+		if currDatapoint.DriveId == uuid.Nil {
+			panic("Writer got a datapoint without a valid drive ID")
+		}
+		if currDatapoint.DriveModelId == uuid.Nil {
+			panic("Writer got a datapoint without a valid drive model ID")
+		}
 		datapointsReadFromChannel++
 	}
 
@@ -202,8 +249,7 @@ func main() {
 
 	//fmt.Println("Starting reader workers")
 	idCaches := &IdAssignmentCaches{
-		DriveModelIdsLock:          sync.RWMutex{},
-		DriveIdsLock:               sync.RWMutex{},
+		CachesLock:                 sync.RWMutex{},
 		DriveModelsToDriveModelIds: make(map[string]uuid.UUID),
 		DriveSerialNumberToId:      make(map[string]uuid.UUID),
 	}
