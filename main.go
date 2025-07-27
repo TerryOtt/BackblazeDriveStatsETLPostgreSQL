@@ -20,6 +20,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+type CmdLineArgs struct {
+	NumReaders uint
+	NumWriters uint
+	CsvDir     string
+}
+
 type DriveHealthDatapoint struct {
 	Date              time.Time
 	DriveSerialNumber string
@@ -38,7 +44,8 @@ type IdAssignmentCaches struct {
 
 func addIdValuesToDatapoint(
 	caches *IdAssignmentCaches,
-	datapoint *DriveHealthDatapoint) {
+	datapoint *DriveHealthDatapoint,
+	dbHandle *pgx.Conn) {
 
 	caches.CachesLock.RLock()
 	// *** CRITICAL SECTION -- READ ONLY -- BEGIN
@@ -73,7 +80,16 @@ func addIdValuesToDatapoint(
 		//fmt.Println("\tCache miss on drive model ID")
 		driveModelId = uuid.New()
 		caches.DriveModelsToDriveModelIds[datapoint.DriveModel] = driveModelId
-		// TODO: add to postgres
+
+		commandTag, err := dbHandle.Exec(context.Background(),
+			"INSERT INTO drive_models (drive_model_id, drive_model, capacity_bytes)"+
+				" VALUES ($1, $2, $3);", driveModelId, datapoint.DriveModel, datapoint.CapacityBytes)
+		if err != nil {
+			panic(err)
+		}
+		if commandTag.RowsAffected() != 1 {
+			panic("Tried to insert new drive model ID but no rows affected")
+		}
 	}
 
 	// Handle drive serial number cache miss
@@ -81,7 +97,16 @@ func addIdValuesToDatapoint(
 		//fmt.Println("\tCache miss on drive ID")
 		driveId = uuid.New()
 		caches.DriveSerialNumberToId[datapoint.DriveSerialNumber] = driveId
-		// TODO: add to postgres
+
+		commandTag, err := dbHandle.Exec(context.Background(),
+			"INSERT INTO drives (drive_id, drive_model, serial_number)"+
+				" VALUES ($1, $2, $3);", driveId, driveModelId, datapoint.DriveSerialNumber)
+		if err != nil {
+			panic(err)
+		}
+		if commandTag.RowsAffected() != 1 {
+			panic("Tried to insert new drive ID but no rows affected")
+		}
 	}
 
 	// *** CRITICAL SECTION -- END
@@ -94,7 +119,8 @@ func addIdValuesToDatapoint(
 
 func connectToDB() *pgx.Conn {
 
-	//fmt.Println("Waiting for CSV filenames over channel")
+	//fmt.Println("Connecting to database...")
+
 	pgHost, envVarExists := os.LookupEnv("PGHOST")
 	if !envVarExists {
 		panic("PGHOST environment variable not set")
@@ -113,7 +139,7 @@ func connectToDB() *pgx.Conn {
 	if !envVarExists {
 		panic("PGPASSFILE environment variable not set")
 	}
-	fmt.Println("Trying to open password file " + pgPassfile)
+	//fmt.Println("Trying to open password file " + pgPassfile)
 	pgPassHandle, err := os.Open(pgPassfile)
 	if err != nil {
 		panic(err)
@@ -134,6 +160,7 @@ func connectToDB() *pgx.Conn {
 				// Check user
 				if (tokens[3] != "*" && tokens[3] == pgUser) || tokens[3] == "*" {
 					pgPassword = tokens[4]
+					break
 				}
 			}
 		}
@@ -148,14 +175,14 @@ func connectToDB() *pgx.Conn {
 		" password=" + pgPassword +
 		" dbname=" + pgDatabase
 
-	fmt.Println("DB connection string:", pgConnectDsnString)
+	//fmt.Println("DB connection string:", pgConnectDsnString)
 
 	dbHandle, err := pgx.Connect(context.Background(), pgConnectDsnString)
 
 	if err != nil {
 		panic("Unable to connect to database")
 	}
-	//fmt.Println("Successfully connected to database!")
+	fmt.Println("Successfully connected to database!")
 
 	return dbHandle
 }
@@ -166,7 +193,8 @@ func readCsvFiles(
 	datapointsChannel chan DriveHealthDatapoint,
 	wg *sync.WaitGroup) {
 
-	connectToDB()
+	dbHandle := connectToDB()
+	defer dbHandle.Close(context.Background())
 
 	// Read from channel until it is closed
 	for csvFile := range csvChannel {
@@ -220,7 +248,7 @@ func readCsvFiles(
 			}
 
 			// This call adds any new ID's generated to postgres before returning
-			addIdValuesToDatapoint(idCaches, &newDatapoint)
+			addIdValuesToDatapoint(idCaches, &newDatapoint, dbHandle)
 
 			// Now datapoint is safe to pass to datapoint writers for eventual write
 			datapointsChannel <- newDatapoint
@@ -231,7 +259,7 @@ func readCsvFiles(
 	wg.Done()
 }
 
-func parseArgs() map[string]any {
+func parseArgs() CmdLineArgs {
 
 	numCpus := runtime.NumCPU()
 
@@ -250,10 +278,10 @@ func parseArgs() map[string]any {
 		os.Exit(1)
 	}
 
-	args := map[string]any{
-		"readers": *numReaders,
-		"writers": *numWriters,
-		"csvDir":  flag.Arg(0),
+	args := CmdLineArgs{
+		uint(*numReaders),
+		uint(*numWriters),
+		flag.Arg(0),
 	}
 
 	return args
@@ -292,7 +320,11 @@ func writerWorker(datapointChannel chan DriveHealthDatapoint, wg *sync.WaitGroup
 			panic("Writer got a datapoint without a valid drive model ID")
 		}
 		datapointsReadFromChannel++
+
+		// TODO: queue  512MB / 400 bytes / numWriters of datapoints before writing
 	}
+
+	// TODO: do we have a partially full datapoint queue to flush?
 
 	fmt.Println("Datapoints received by writer: ", datapointsReadFromChannel)
 	// Mark that we've done our work to let the waitgroup proceed towards
@@ -301,11 +333,18 @@ func writerWorker(datapointChannel chan DriveHealthDatapoint, wg *sync.WaitGroup
 }
 
 func main() {
+	idCaches := &IdAssignmentCaches{
+		CachesLock:                 sync.RWMutex{},
+		DriveModelsToDriveModelIds: make(map[string]uuid.UUID),
+		DriveSerialNumberToId:      make(map[string]uuid.UUID),
+	}
+	// TODO: need to pre-pop the ID caches from the DB here
+
 	fmt.Println("Parsing cmdline args")
 	args := parseArgs()
 
 	fmt.Println("Finding CSV files")
-	csvList := getCsvListFromDir(args["csvDir"].(string))
+	csvList := getCsvListFromDir(args.CsvDir)
 
 	// Create waitgroup so we know when all CSV readers are done
 	var csvWg sync.WaitGroup
@@ -321,25 +360,21 @@ func main() {
 	datapointsChannel := make(chan DriveHealthDatapoint, ChannelSize)
 
 	//fmt.Println("Starting reader workers")
-	idCaches := &IdAssignmentCaches{
-		CachesLock:                 sync.RWMutex{},
-		DriveModelsToDriveModelIds: make(map[string]uuid.UUID),
-		DriveSerialNumberToId:      make(map[string]uuid.UUID),
-	}
-
-	const NumReaders int = 1
-	for i := 0; i < NumReaders; i++ {
+	NumReaders := min(uint(len(csvList)), args.NumReaders)
+	for i := uint(0); i < NumReaders; i++ {
 		csvWg.Add(1)
 		go readCsvFiles(idCaches, csvFilenamesChannel, datapointsChannel, &csvWg)
 	}
+	fmt.Println("Started reader worker pool with size: " + strconv.FormatUint(uint64(NumReaders), 10))
 
 	//fmt.Println("Starting writer workers")
 	var datapointWaitgroup sync.WaitGroup
-	const NumWriters int = 1
-	for i := 0; i < NumWriters; i++ {
+	NumWriters := args.NumWriters
+	for i := uint(0); i < NumWriters; i++ {
 		datapointWaitgroup.Add(1)
 		go writerWorker(datapointsChannel, &datapointWaitgroup)
 	}
+	fmt.Println("Started writer worker pool with size: " + strconv.FormatUint(uint64(NumWriters), 10))
 
 	// Send all CSV files over the channel to the readers
 	for _, currCsvFilename := range csvList {
