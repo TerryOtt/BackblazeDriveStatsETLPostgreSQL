@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/csv"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,26 +92,81 @@ func addIdValuesToDatapoint(
 	datapoint.DriveModelId = driveModelId
 }
 
-func readCsvFiles(
-	idCaches *IdAssignmentCaches,
-	csvChannel chan string,
-	datapointsChannel chan DriveHealthDatapoint,
-	wg *sync.WaitGroup) {
-
-	// Read .pgpass file so we don't keep password in env vars
+func connectToDB() *pgx.Conn {
 
 	//fmt.Println("Waiting for CSV filenames over channel")
-	pgConnectDsnString := "host=" + os.Getenv("PGHOST") +
-		" user=" + os.Getenv("PGUSER") +
-		" password=" + os.Getenv("PGPASSWORD") +
-		" dbname=" + os.Getenv("PGDATABASE")
+	pgHost, envVarExists := os.LookupEnv("PGHOST")
+	if !envVarExists {
+		panic("PGHOST environment variable not set")
+	}
+	pgUser, envVarExists := os.LookupEnv("PGUSER")
+	if !envVarExists {
+		panic("PGUSER environment variable not set")
+	}
+	pgDatabase, envVarExists := os.LookupEnv("PGDATABASE")
+	if !envVarExists {
+		panic("PGDATABASE environment variable not set")
+	}
+
+	// Read .pgpass file so we don't keep password in env vars
+	pgPassfile, envVarExists := os.LookupEnv("PGPASSFILE")
+	if !envVarExists {
+		panic("PGPASSFILE environment variable not set")
+	}
+	fmt.Println("Trying to open password file " + pgPassfile)
+	pgPassHandle, err := os.Open(pgPassfile)
+	if err != nil {
+		panic(err)
+	}
+	defer pgPassHandle.Close()
+	pgPassword := ""
+	scanner := bufio.NewScanner(pgPassHandle)
+	for scanner.Scan() {
+		line := scanner.Text()
+		tokens := strings.Split(line, ":")
+		if len(tokens) != 5 {
+			panic("invalid .pgpass file line: " + line)
+		}
+		// Is this the droids we are looking for?
+		if tokens[0] == pgHost {
+			// Check DB name match
+			if (tokens[2] != "*" && tokens[2] == pgDatabase) || tokens[2] == "*" {
+				// Check user
+				if (tokens[3] != "*" && tokens[3] == pgUser) || tokens[3] == "*" {
+					pgPassword = tokens[4]
+				}
+			}
+		}
+	}
+	if pgPassword == "" {
+		panic("Did not find matching entry in PGPASSFILE file")
+	}
+
+	// password is fifth and final token with colon delimiters
+	pgConnectDsnString := "host=" + pgHost +
+		" user=" + pgUser +
+		" password=" + pgPassword +
+		" dbname=" + pgDatabase
+
+	fmt.Println("DB connection string:", pgConnectDsnString)
 
 	dbHandle, err := pgx.Connect(context.Background(), pgConnectDsnString)
 
 	if err != nil {
 		panic("Unable to connect to database")
 	}
-	defer dbHandle.Close(context.Background())
+	//fmt.Println("Successfully connected to database!")
+
+	return dbHandle
+}
+
+func readCsvFiles(
+	idCaches *IdAssignmentCaches,
+	csvChannel chan string,
+	datapointsChannel chan DriveHealthDatapoint,
+	wg *sync.WaitGroup) {
+
+	connectToDB()
 
 	// Read from channel until it is closed
 	for csvFile := range csvChannel {
@@ -270,7 +327,7 @@ func main() {
 		DriveSerialNumberToId:      make(map[string]uuid.UUID),
 	}
 
-	const NumReaders int = 20
+	const NumReaders int = 1
 	for i := 0; i < NumReaders; i++ {
 		csvWg.Add(1)
 		go readCsvFiles(idCaches, csvFilenamesChannel, datapointsChannel, &csvWg)
