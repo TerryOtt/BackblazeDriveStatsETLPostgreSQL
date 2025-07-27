@@ -1,10 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"flag"
 	"fmt"
-	"github.com/google/uuid"
 	"io"
 	"io/fs"
 	"os"
@@ -13,6 +13,9 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type DriveHealthDatapoint struct {
@@ -93,7 +96,20 @@ func readCsvFiles(
 	datapointsChannel chan DriveHealthDatapoint,
 	wg *sync.WaitGroup) {
 
+	// Read .pgpass file so we don't keep password in env vars
+
 	//fmt.Println("Waiting for CSV filenames over channel")
+	pgConnectDsnString := "host=" + os.Getenv("PGHOST") +
+		" user=" + os.Getenv("PGUSER") +
+		" password=" + os.Getenv("PGPASSWORD") +
+		" dbname=" + os.Getenv("PGDATABASE")
+
+	dbHandle, err := pgx.Connect(context.Background(), pgConnectDsnString)
+
+	if err != nil {
+		panic("Unable to connect to database")
+	}
+	defer dbHandle.Close(context.Background())
 
 	// Read from channel until it is closed
 	for csvFile := range csvChannel {
@@ -221,7 +237,7 @@ func writerWorker(datapointChannel chan DriveHealthDatapoint, wg *sync.WaitGroup
 		datapointsReadFromChannel++
 	}
 
-	fmt.Println("\tWriter saw this many datapoints: ", datapointsReadFromChannel)
+	fmt.Println("Datapoints received by writer: ", datapointsReadFromChannel)
 	// Mark that we've done our work to let the waitgroup proceed towards
 	//		unblocking
 	wg.Done()
