@@ -119,7 +119,7 @@ func addIdValuesToDatapoint(
 
 func connectToDB() *pgx.Conn {
 
-	//fmt.Println("Connecting to database...")
+	//fmt.Println("\nConnecting to database...")
 
 	pgHost, envVarExists := os.LookupEnv("PGHOST")
 	if !envVarExists {
@@ -182,7 +182,7 @@ func connectToDB() *pgx.Conn {
 	if err != nil {
 		panic("Unable to connect to database")
 	}
-	fmt.Println("Successfully connected to database!")
+	//fmt.Println("\tSuccessfully connected to database!")
 
 	return dbHandle
 }
@@ -326,24 +326,62 @@ func writerWorker(datapointChannel chan DriveHealthDatapoint, wg *sync.WaitGroup
 
 	// TODO: do we have a partially full datapoint queue to flush?
 
-	fmt.Println("Datapoints received by writer: ", datapointsReadFromChannel)
+	//fmt.Println("Datapoints received by writer: ", datapointsReadFromChannel)
+
 	// Mark that we've done our work to let the waitgroup proceed towards
 	//		unblocking
 	wg.Done()
 }
 
-func main() {
+func createAndPopulateCaches() *IdAssignmentCaches {
+	fmt.Println("\nCreating and populating ID caches...")
 	idCaches := &IdAssignmentCaches{
 		CachesLock:                 sync.RWMutex{},
 		DriveModelsToDriveModelIds: make(map[string]uuid.UUID),
 		DriveSerialNumberToId:      make(map[string]uuid.UUID),
 	}
-	// TODO: need to pre-pop the ID caches from the DB here
 
-	fmt.Println("Parsing cmdline args")
+	dbHandle := connectToDB()
+	defer dbHandle.Close(context.Background())
+
+	rows, _ := dbHandle.Query(context.Background(),
+		"SELECT 	drive_model, drive_model_id "+
+			"FROM 		drive_models;")
+
+	var modelString string
+	var modelId uuid.UUID
+	_, err := pgx.ForEachRow(rows, []any{&modelString, &modelId}, func() error {
+		idCaches.DriveModelsToDriveModelIds[modelString] = modelId
+		return nil
+	})
+	if err != nil {
+		panic("Error when reading drive model info")
+	}
+
+	rows, _ = dbHandle.Query(context.Background(),
+		"SELECT 	serial_number, drive_id "+
+			"FROM 		drives;")
+
+	var serialNumber string
+	var driveID uuid.UUID
+	_, err = pgx.ForEachRow(rows, []any{&serialNumber, &driveID}, func() error {
+		idCaches.DriveSerialNumberToId[serialNumber] = driveID
+		return nil
+	})
+	if err != nil {
+		panic("Error when reading drive infos")
+	}
+
+	fmt.Println("\tNumber of drive models in DB: " + strconv.Itoa(len(idCaches.DriveModelsToDriveModelIds)))
+	fmt.Println("\t      Number of drives in DB: " + strconv.Itoa(len(idCaches.DriveSerialNumberToId)))
+	return idCaches
+}
+
+func main() {
+	//fmt.Println("Parsing cmdline args")
 	args := parseArgs()
 
-	fmt.Println("Finding CSV files")
+	fmt.Println("\nFinding CSV files...")
 	csvList := getCsvListFromDir(args.CsvDir)
 
 	// Create waitgroup so we know when all CSV readers are done
@@ -359,13 +397,15 @@ func main() {
 	)
 	datapointsChannel := make(chan DriveHealthDatapoint, ChannelSize)
 
+	idCaches := createAndPopulateCaches()
+
 	//fmt.Println("Starting reader workers")
 	NumReaders := min(uint(len(csvList)), args.NumReaders)
 	for i := uint(0); i < NumReaders; i++ {
 		csvWg.Add(1)
 		go readCsvFiles(idCaches, csvFilenamesChannel, datapointsChannel, &csvWg)
 	}
-	fmt.Println("Started reader worker pool with size: " + strconv.FormatUint(uint64(NumReaders), 10))
+	//fmt.Println("Started reader worker pool with size: " + strconv.FormatUint(uint64(NumReaders), 10))
 
 	//fmt.Println("Starting writer workers")
 	var datapointWaitgroup sync.WaitGroup
@@ -374,12 +414,16 @@ func main() {
 		datapointWaitgroup.Add(1)
 		go writerWorker(datapointsChannel, &datapointWaitgroup)
 	}
-	fmt.Println("Started writer worker pool with size: " + strconv.FormatUint(uint64(NumWriters), 10))
+	//fmt.Println("Started writer worker pool with size: " + strconv.FormatUint(uint64(NumWriters), 10))
 
+	fmt.Println("\nStarting data processing pipeline...")
+
+	fmt.Println("\tTODO: for each CSV, pull datapoints for that day from DB to find out which are new")
 	// Send all CSV files over the channel to the readers
 	for _, currCsvFilename := range csvList {
 		csvFilenamesChannel <- currCsvFilename
 	}
+	fmt.Println("\tAll CSV filenames sent to reader worker pool, waiting for reader workers to complete")
 
 	// Close the channel to bring readers home
 	close(csvFilenamesChannel)
@@ -390,12 +434,14 @@ func main() {
 	// at this point, we can mark the ID caches eligible for garbage collection
 	idCaches = nil
 
-	fmt.Println("All datapoints have been read, waiting for writes to complete")
+	fmt.Println("\tReader workers have processed all CSV files, waiting for writes to complete")
 
 	// Signal writers that they should terminate once their channel is empty,
 	//		as all datapoints are written
 	close(datapointsChannel)
 	datapointWaitgroup.Wait()
+	fmt.Println("\tTODO: buffer and then periodically flush buffered datapoints to DB")
+	fmt.Println("\tAll datapoints have been successfully written")
 
-	fmt.Println("All datapoints have been successfully written")
+	fmt.Println("\nDone!")
 }
