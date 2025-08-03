@@ -198,7 +198,7 @@ func readCsvFiles(
 
 	// Read from channel until it is closed
 	for csvFile := range csvChannel {
-		fmt.Println("\tReading CSV file ", csvFile)
+		//fmt.Println("\tReading CSV file ", csvFile)
 		fileHandle, err := os.Open(csvFile)
 		if err != nil {
 			panic(err)
@@ -207,7 +207,7 @@ func readCsvFiles(
 
 		// Pull date for this file -- filename minus CSV extension is the date
 		fileDate := strings.TrimSuffix(filepath.Base(csvFile), filepath.Ext(csvFile))
-		fmt.Println("\tDate of datapoints in CSV:", fileDate)
+		//fmt.Println("\tDate of datapoints in CSV:", fileDate)
 
 		// Grab all drive serial numbers seen in the DB on this date, so we can find out which
 		//		CSV datapoints are new -- if any
@@ -231,8 +231,8 @@ func readCsvFiles(
 		if err != nil {
 			panic("Error when reading drive model info")
 		}
-		fmt.Println("\tInitialized serials seen on " + fileDate + " with " +
-			strconv.Itoa(len(driveSerialsSeen)) + " serials")
+		//fmt.Println("\tInitialized serials seen on " + fileDate + " with " +
+		//	strconv.Itoa(len(driveSerialsSeen)) + " serials")
 
 		csvReader := csv.NewReader(fileHandle)
 		// Skip header row
@@ -365,7 +365,7 @@ func writerWorker(args CmdLineArgs, datapointChannel chan DriveHealthDatapoint, 
 
 	// Want to hold up to 512MB across all writers at ~400 bytes per datapoint
 	maxDeferredWrites := ((512 * 1024 * 1024) / 400) / args.NumWriters
-	deferredWrites := make([]DriveHealthDatapoint, maxDeferredWrites)
+	var deferredWrites []DriveHealthDatapoint
 	currDeferredWrites := uint(0)
 
 	dbHandle := connectToDB()
@@ -391,6 +391,7 @@ func writerWorker(args CmdLineArgs, datapointChannel chan DriveHealthDatapoint, 
 			deferredWrites = make([]DriveHealthDatapoint, maxDeferredWrites)
 			currDeferredWrites = 0
 		}
+
 	}
 
 	if currDeferredWrites > 0 {
