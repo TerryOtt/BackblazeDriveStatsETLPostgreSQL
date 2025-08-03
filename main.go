@@ -388,7 +388,7 @@ func writerWorker(args CmdLineArgs, datapointChannel chan DriveHealthDatapoint, 
 		// Do deferred work if needed
 		if currDeferredWrites == maxDeferredWrites {
 			doDeferredWrites(dbHandle, deferredWrites)
-			deferredWrites = make([]DriveHealthDatapoint, maxDeferredWrites)
+			deferredWrites = nil // Nil slices are "well behaved," it just means empty
 			currDeferredWrites = 0
 		}
 
