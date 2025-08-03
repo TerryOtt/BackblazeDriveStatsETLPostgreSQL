@@ -198,12 +198,42 @@ func readCsvFiles(
 
 	// Read from channel until it is closed
 	for csvFile := range csvChannel {
-		//fmt.Println("\tReading CSV file ", csvFile)
+		fmt.Println("\tReading CSV file ", csvFile)
 		fileHandle, err := os.Open(csvFile)
 		if err != nil {
 			panic(err)
 		}
 		defer fileHandle.Close()
+
+		// Pull date for this file -- filename minus CSV extension is the date
+		fileDate := strings.TrimSuffix(filepath.Base(csvFile), filepath.Ext(csvFile))
+		fmt.Println("\tDate of datapoints in CSV:", fileDate)
+
+		// Grab all drive serial numbers seen in the DB on this date, so we can find out which
+		//		CSV datapoints are new -- if any
+		rows, err := dbHandle.Query(context.Background(),
+			"SELECT 	drives.serial_number "+
+				"FROM 		drives "+
+				"JOIN		drives_dates_seen "+
+				"ON 		drives.drive_id = drives_dates_seen.drive_id "+
+				"AND 		drives_dates_seen.date_seen = $1;", fileDate)
+		if err != nil {
+			panic(err)
+		}
+
+		// Struct{} is zero bytes, making this map effectively a set
+		driveSerialsSeen := make(map[string]struct{})
+		var driveSerial string
+		_, err = pgx.ForEachRow(rows, []any{&driveSerial}, func() error {
+			driveSerialsSeen[driveSerial] = struct{}{}
+			return nil
+		})
+		if err != nil {
+			panic("Error when reading drive model info")
+		}
+		fmt.Println("\tInitialized serials seen on this date with " + strconv.Itoa(len(driveSerialsSeen)) +
+			" serials")
+
 		csvReader := csv.NewReader(fileHandle)
 		// Skip header row
 		_, err = csvReader.Read()
@@ -220,6 +250,12 @@ func readCsvFiles(
 			if err != nil {
 				panic(err)
 			}
+			// If the DB already has an entry for this serial number on the given date, skip it
+			if _, ok := driveSerialsSeen[csvRow[1]]; ok {
+				// Skip this datapoint
+				continue
+			}
+
 			// Parse date
 			datapointDate, err := time.Parse(time.DateOnly, csvRow[0])
 			if err != nil {
@@ -418,7 +454,6 @@ func main() {
 
 	fmt.Println("\nStarting data processing pipeline...")
 
-	fmt.Println("\tTODO: for each CSV, pull datapoints for that day from DB to find out which are new")
 	// Send all CSV files over the channel to the readers
 	for _, currCsvFilename := range csvList {
 		csvFilenamesChannel <- currCsvFilename
