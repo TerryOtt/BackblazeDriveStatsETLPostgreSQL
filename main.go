@@ -231,8 +231,8 @@ func readCsvFiles(
 		if err != nil {
 			panic("Error when reading drive model info")
 		}
-		fmt.Println("\tInitialized serials seen on this date with " + strconv.Itoa(len(driveSerialsSeen)) +
-			" serials")
+		fmt.Println("\tInitialized serials seen on " + fileDate + " with " +
+			strconv.Itoa(len(driveSerialsSeen)) + " serials")
 
 		csvReader := csv.NewReader(fileHandle)
 		// Skip header row
@@ -342,11 +342,36 @@ func getCsvListFromDir(csvDir string) []string {
 	return csvList
 }
 
-func writerWorker(datapointChannel chan DriveHealthDatapoint, wg *sync.WaitGroup) {
+func doDeferredWrites(dbHandle *pgx.Conn, deferredWrites []DriveHealthDatapoint) {
+	//fmt.Println("\tDoing deferred writes")
+
+	// Do a COPY command as it's the fastest way to blast data into PostgreSQL
+	_, err := dbHandle.CopyFrom(
+		context.Background(),
+		pgx.Identifier{"drives_dates_seen"},
+		[]string{"drive_id", "date_seen", "failure"},
+		pgx.CopyFromSlice(len(deferredWrites), func(i int) ([]any, error) {
+			return []any{deferredWrites[i].DriveId, deferredWrites[i].Date, deferredWrites[i].Failure}, nil
+		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+	//fmt.Println("\tWrote " + strconv.FormatInt(copyCount, 10) + " datapoints during deferred writes")
+}
+
+func writerWorker(args CmdLineArgs, datapointChannel chan DriveHealthDatapoint, wg *sync.WaitGroup) {
 	//fmt.Println("Entering writer worker")
 
+	// Want to hold up to 512MB across all writers at ~400 bytes per datapoint
+	maxDeferredWrites := ((512 * 1024 * 1024) / 400) / args.NumWriters
+	deferredWrites := make([]DriveHealthDatapoint, maxDeferredWrites)
+	currDeferredWrites := uint(0)
+
+	dbHandle := connectToDB()
+	defer dbHandle.Close(context.Background())
+
 	// Read from channel until it's both empty AND closed
-	datapointsReadFromChannel := 0
 	for currDatapoint := range datapointChannel {
 		//fmt.Println("\t\tWriter worker got datapoint: ", currDatapoint)
 		if currDatapoint.DriveId == uuid.Nil {
@@ -355,17 +380,24 @@ func writerWorker(datapointChannel chan DriveHealthDatapoint, wg *sync.WaitGroup
 		if currDatapoint.DriveModelId == uuid.Nil {
 			panic("Writer got a datapoint without a valid drive model ID")
 		}
-		datapointsReadFromChannel++
 
-		// TODO: queue  512MB / 400 bytes / numWriters of datapoints before writing
+		// queue it
+		deferredWrites = append(deferredWrites, currDatapoint)
+		currDeferredWrites++
+
+		// Do deferred work if needed
+		if currDeferredWrites == maxDeferredWrites {
+			doDeferredWrites(dbHandle, deferredWrites)
+			deferredWrites = make([]DriveHealthDatapoint, maxDeferredWrites)
+			currDeferredWrites = 0
+		}
 	}
 
-	// TODO: do we have a partially full datapoint queue to flush?
+	if currDeferredWrites > 0 {
+		doDeferredWrites(dbHandle, deferredWrites)
+	}
 
-	//fmt.Println("Datapoints received by writer: ", datapointsReadFromChannel)
-
-	// Mark that we've done our work to let the waitgroup proceed towards
-	//		unblocking
+	// Mark that we've done our work to let the waitgroup proceed towards unblocking
 	wg.Done()
 }
 
@@ -448,7 +480,7 @@ func main() {
 	NumWriters := args.NumWriters
 	for i := uint(0); i < NumWriters; i++ {
 		datapointWaitgroup.Add(1)
-		go writerWorker(datapointsChannel, &datapointWaitgroup)
+		go writerWorker(args, datapointsChannel, &datapointWaitgroup)
 	}
 	//fmt.Println("Started writer worker pool with size: " + strconv.FormatUint(uint64(NumWriters), 10))
 
@@ -475,8 +507,7 @@ func main() {
 	//		as all datapoints are written
 	close(datapointsChannel)
 	datapointWaitgroup.Wait()
-	fmt.Println("\tTODO: buffer and then periodically flush buffered datapoints to DB")
-	fmt.Println("\tAll datapoints have been successfully written")
+	fmt.Println("\tAll new datapoints from CSV have been successfully written")
 
 	fmt.Println("\nDone!")
 }
